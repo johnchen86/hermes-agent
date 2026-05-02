@@ -375,8 +375,8 @@ async def _api_post(
 ) -> Dict[str, Any]:
     body = _json_dumps({**payload, "base_info": _base_info()})
     url = f"{base_url.rstrip('/')}/{endpoint}"
-    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
-    async with session.post(url, data=body, headers=_headers(token, body), timeout=timeout) as response:
+    timeout_seconds = timeout_ms / 1000
+    async with session.post(url, data=body, headers=_headers(token, body), timeout=timeout_seconds) as response:
         raw = await response.text()
         if not response.ok:
             raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
@@ -395,8 +395,8 @@ async def _api_get(
         "iLink-App-Id": ILINK_APP_ID,
         "iLink-App-ClientVersion": str(ILINK_APP_CLIENT_VERSION),
     }
-    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
-    async with session.get(url, headers=headers, timeout=timeout) as response:
+    timeout_seconds = timeout_ms / 1000
+    async with session.get(url, headers=headers, timeout=timeout_seconds) as response:
         raw = await response.text()
         if not response.ok:
             raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
@@ -548,8 +548,7 @@ async def _upload_ciphertext(
     Accepts either a constructed CDN URL (from upload_param) or a direct
     upload_full_url — both use POST with the raw ciphertext as the body.
     """
-    timeout = aiohttp.ClientTimeout(total=120)
-    async with session.post(upload_url, data=ciphertext, headers={"Content-Type": "application/octet-stream"}, timeout=timeout) as response:
+    async with session.post(upload_url, data=ciphertext, headers={"Content-Type": "application/octet-stream"}, timeout=120) as response:
         if response.status == 200:
             encrypted_param = response.headers.get("x-encrypted-param")
             if encrypted_param:
@@ -567,8 +566,7 @@ async def _download_bytes(
     url: str,
     timeout_seconds: float = 60.0,
 ) -> bytes:
-    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with session.get(url, timeout=timeout) as response:
+    async with session.get(url, timeout=timeout_seconds) as response:
         response.raise_for_status()
         return await response.read()
 
@@ -1817,7 +1815,7 @@ class WeixinAdapter(BasePlatformAdapter):
             raise ValueError(f"Blocked unsafe URL (SSRF protection): {url}")
 
         assert self._send_session is not None
-        async with self._send_session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+        async with self._send_session.get(url, timeout=30) as response:
             response.raise_for_status()
             data = await response.read()
             suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
@@ -2030,7 +2028,29 @@ async def send_weixin_direct(
 
     live_adapter = _LIVE_ADAPTERS.get(resolved_token)
     send_session = getattr(live_adapter, '_send_session', None)
-    if live_adapter is not None and send_session is not None and not send_session.closed:
+
+    # Skip the live adapter path if the session's event loop differs from the
+    # current task's loop (issue #10153 — aiohttp 3.13+ raises
+    # "Timeout context manager should be used inside a task" when a
+    # ClientSession created on one loop is used from another).
+    _same_loop = False
+    if send_session is not None and not send_session.closed:
+        try:
+            _same_loop = send_session.loop.is_running()
+        except Exception:
+            _same_loop = False
+        # Verify the current task is on that same loop
+        if _same_loop:
+            try:
+                _current_task = asyncio.current_task()
+                _same_loop = (
+                    _current_task is not None
+                    and _current_task.get_loop() == send_session.loop
+                )
+            except Exception:
+                _same_loop = False
+
+    if _same_loop and live_adapter is not None:
         last_result: Optional[SendResult] = None
         cleaned = live_adapter.format_message(message)
         if cleaned:
